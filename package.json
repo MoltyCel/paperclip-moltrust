@@ -1,0 +1,48 @@
+{
+  "name": "paperclip-plugin-moltrust",
+  "version": "0.1.0",
+  "description": "MolTrust for Paperclip: a W3C DID for every agent on hire, the company budget as an AAE mandate, and a fail-closed check before every spend.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Lars Kroehl <lars@moltrust.ch>",
+  "homepage": "https://github.com/MoltyCel/paperclip-moltrust#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MoltyCel/paperclip-moltrust.git"
+  },
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "moltrust",
+    "did",
+    "aae",
+    "agent-trust",
+    "budget",
+    "zero-human-company"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "pack:release": "npm run build && npm pack"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "^2026.1023.0",
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12"
+  }
+}

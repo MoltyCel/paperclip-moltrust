@@ -1,0 +1,164 @@
+{
+ "source": "POST https://api.moltrust.ch/enforce/check",
+ "fetched_at": "2026-11-06T21:51:52.206Z",
+ "mandate": {
+  "profile": "paperclip-company-budget/v1",
+  "subject": {
+   "platform": "paperclip",
+   "company_id": "11111111-2222-3333-4444-555555555555"
+  },
+  "budget": {
+   "amount_cents": 50000,
+   "currency": "USD"
+  },
+  "validity": {
+   "not_before": 1794000000,
+   "not_after": 1796678400
+  },
+  "grants": [
+   {
+    "action_binding": "sha256:cd0b491b1da349eba2b37fef307baf1b01e5a28e1e49355f2424d465b6a8277e",
+    "type_fields": [
+     "verb",
+     "currency"
+    ],
+    "disposition": "allow",
+    "constraints": [
+     {
+      "type": "range",
+      "field": "amount_cents",
+      "lo": 1,
+      "hi": 50000
+     },
+     {
+      "type": "range",
+      "field": "spent_after_cents",
+      "lo": 0,
+      "hi": 50000
+     },
+     {
+      "type": "range",
+      "field": "requested_at",
+      "lo": 1794000000,
+      "hi": 1796678400
+     }
+    ]
+   },
+   {
+    "action_binding": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819",
+    "type_fields": [
+     "verb",
+     "currency"
+    ],
+    "disposition": "allow",
+    "constraints": [
+     {
+      "type": "range",
+      "field": "amount_cents",
+      "lo": 1,
+      "hi": 50000
+     },
+     {
+      "type": "range",
+      "field": "spent_after_cents",
+      "lo": 0,
+      "hi": 50000
+     },
+     {
+      "type": "range",
+      "field": "requested_at",
+      "lo": 1794000000,
+      "hi": 1796678400
+     }
+    ]
+   }
+  ]
+ },
+ "cases": [
+  {
+   "name": "within budget",
+   "transaction": {
+    "action": {
+     "verb": "purchase",
+     "currency": "USD"
+    },
+    "amount_cents": 12000,
+    "spent_after_cents": 12000,
+    "requested_at": 1794003600
+   },
+   "verdict": "PERMIT",
+   "reason": "grant[1] matched, all constraints hold, disposition=allow",
+   "action_digest": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819",
+   "mandate_digest": "sha256:96eeef532d962de1185e68078985eae1ccb6bc00718baa5c342bfd4fca08304b",
+   "local_action_digest": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819"
+  },
+  {
+   "name": "over budget",
+   "transaction": {
+    "action": {
+     "verb": "purchase",
+     "currency": "USD"
+    },
+    "amount_cents": 60000,
+    "spent_after_cents": 60000,
+    "requested_at": 1794003600
+   },
+   "verdict": "DENY",
+   "reason": "no matching grant satisfied its constraints",
+   "action_digest": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819",
+   "mandate_digest": "sha256:96eeef532d962de1185e68078985eae1ccb6bc00718baa5c342bfd4fca08304b",
+   "local_action_digest": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819"
+  },
+  {
+   "name": "running total over budget",
+   "transaction": {
+    "action": {
+     "verb": "ad_spend",
+     "currency": "USD"
+    },
+    "amount_cents": 20000,
+    "spent_after_cents": 50001,
+    "requested_at": 1794003600
+   },
+   "verdict": "DENY",
+   "reason": "no matching grant satisfied its constraints",
+   "action_digest": "sha256:cd0b491b1da349eba2b37fef307baf1b01e5a28e1e49355f2424d465b6a8277e",
+   "mandate_digest": "sha256:96eeef532d962de1185e68078985eae1ccb6bc00718baa5c342bfd4fca08304b",
+   "local_action_digest": "sha256:cd0b491b1da349eba2b37fef307baf1b01e5a28e1e49355f2424d465b6a8277e"
+  },
+  {
+   "name": "action not granted",
+   "transaction": {
+    "action": {
+     "verb": "transfer",
+     "currency": "USD"
+    },
+    "amount_cents": 100,
+    "spent_after_cents": 100,
+    "requested_at": 1794003600
+   },
+   "verdict": "DENY",
+   "reason": "unaddressed action: no grant binds this action digest",
+   "action_digest": "sha256:e314f6ae25ac965a3887529ee36259c2d3eb4661f1dbd8ae07fc6ef8c493202b",
+   "mandate_digest": "sha256:96eeef532d962de1185e68078985eae1ccb6bc00718baa5c342bfd4fca08304b",
+   "local_action_digest": "sha256:e314f6ae25ac965a3887529ee36259c2d3eb4661f1dbd8ae07fc6ef8c493202b"
+  },
+  {
+   "name": "after mandate expiry",
+   "transaction": {
+    "action": {
+     "verb": "purchase",
+     "currency": "USD"
+    },
+    "amount_cents": 100,
+    "spent_after_cents": 100,
+    "requested_at": 1796678401
+   },
+   "verdict": "DENY",
+   "reason": "no matching grant satisfied its constraints",
+   "action_digest": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819",
+   "mandate_digest": "sha256:96eeef532d962de1185e68078985eae1ccb6bc00718baa5c342bfd4fca08304b",
+   "local_action_digest": "sha256:d5cda39632df7dc1551cb7bed98c57bd79fbb1cdbdbe65b0ec2f642fc4c73819"
+  }
+ ]
+}
