@@ -79,7 +79,12 @@ The DID registry is public: a registered DID, its public key and its display nam
 ## How it hooks into Paperclip
 
 - `company.created` / `company.updated` → mandate.
-- `agent.created`, and `approval.decided` when it carries an agent id → DID registration; a reconcile job every 5 minutes registers any agent still without a DID (for example hires approved while the worker was down). Registration is idempotent per agent.
+- `agent.created`, and `approval.decided` when it carries an agent id → DID registration. Registration is idempotent per agent.
+- Worker start (install, restart, and every config change, since the host restarts the worker to apply it) and the reconcile job every 5 minutes → one pass per company that registers every agent still without a DID, so a company that already has agents, or hires several at once, gets all of them registered in one step. Terminated agents and hires pending approval are skipped until they become active.
+
+### Rate limit
+
+MolTrust limits keyless registration per source IP: `POST /identity/register-pop` 30 per hour, `GET /identity/register-challenge` 60 per minute. All companies of one Paperclip instance share that budget. A company with more than 30 unregistered agents is therefore registered over more than one hour: the pass stops at the first HTTP 429, the plugin pauses all registrations (1 minute, doubling on each further 429 up to 1 hour, or longer if the server sends `Retry-After`), and the reconcile job continues where it stopped. During the pause the plugin makes no registration calls; `check_spend` keeps working and sends no `X-MolTrust-DID` for an agent without a DID. The activity log gets one summary line per company and pass: registered, already registered, left for later.
 - `check_spend` tool → `/enforce/check`, activity log entry for each verdict.
 
 Paperclip has no synchronous veto hook for plugins, so the check runs where the agent asks for it. For tools that go through Paperclip's MCP tool gateway you can add a `require_approval` policy as a second line.

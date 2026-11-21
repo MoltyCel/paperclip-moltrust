@@ -44,7 +44,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       jobKey: "reconcile",
       displayName: "MolTrust reconcile",
-      description: "Registers agents that have no DID yet (hires approved later) and renews expired mandates.",
+      description: "Registers every agent that has no DID yet, company by company, within the MolTrust rate limit, and renews expired mandates.",
       schedule: "*/5 * * * *",
     },
   ],

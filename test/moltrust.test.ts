@@ -7,7 +7,9 @@ import {
   canonicalize,
   checkSpend,
   mandateDigest,
+  RateLimitedError,
   registerAgent,
+  retryAfterMs,
   solvePow,
   type FetchLike,
 } from "../src/moltrust.js";
@@ -83,6 +85,28 @@ describe("registration", () => {
         ? Response.json({ challenge: "a.b", pow: { seed: "a", difficulty_bits: 0 } })
         : new Response("rate limited", { status: 429 });
     await expect(registerAgent({ apiUrl: "https://x", platform: "paperclip", fetch: fake })).rejects.toThrow(/429/);
+  });
+
+  it("a 429 is a RateLimitedError carrying the route and Retry-After", async () => {
+    const fake: FetchLike = async (url) =>
+      url.endsWith("/identity/register-challenge")
+        ? Response.json({ challenge: "a.b", pow: { seed: "a", difficulty_bits: 0 } })
+        : new Response("", { status: 429, headers: { "Retry-After": "120" } });
+    const err = await registerAgent({ apiUrl: "https://x", platform: "paperclip", fetch: fake }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect(err).toMatchObject({ route: "register-pop", retryAfterMs: 120_000 });
+
+    const onChallenge: FetchLike = async () => new Response("", { status: 429 });
+    const err2 = await registerAgent({ apiUrl: "https://x", platform: "paperclip", fetch: onChallenge }).catch((e: unknown) => e);
+    expect(err2).toMatchObject({ route: "register-challenge", retryAfterMs: null });
+  });
+
+  it("reads Retry-After as seconds or as an HTTP date", () => {
+    const now = new Date("2026-11-06T12:00:00Z");
+    expect(retryAfterMs(new Response("", { headers: { "Retry-After": "30" } }), now)).toBe(30_000);
+    expect(retryAfterMs(new Response("", { headers: { "Retry-After": "Fri, 06 Nov 2026 12:05:00 GMT" } }), now)).toBe(300_000);
+    expect(retryAfterMs(new Response(""), now)).toBeNull();
+    expect(retryAfterMs(new Response("", { headers: { "Retry-After": "soon" } }), now)).toBeNull();
   });
 });
 
