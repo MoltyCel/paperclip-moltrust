@@ -96,6 +96,31 @@ function rawPublicKeyHex(pub: KeyObject): string {
   return Buffer.from(der.subarray(der.length - 32)).toString("hex");
 }
 
+/**
+ * MolTrust refused a registration with HTTP 429. The keyless routes are
+ * limited per source IP (register-pop 30/hour, register-challenge 60/minute),
+ * so one Paperclip instance shares one budget across all its companies.
+ * `retryAfterMs` is the server's Retry-After, or null when it sent none.
+ */
+export class RateLimitedError extends Error {
+  constructor(
+    readonly route: string,
+    readonly retryAfterMs: number | null,
+  ) {
+    super(`${route} answered HTTP 429 (rate limited)`);
+    this.name = "RateLimitedError";
+  }
+}
+
+/** Retry-After as delay-seconds or HTTP date; null when absent or unreadable. */
+export function retryAfterMs(res: Response, now: Date = new Date()): number | null {
+  const v = res.headers.get("retry-after");
+  if (!v) return null;
+  if (/^\d+$/.test(v.trim())) return Number(v.trim()) * 1000;
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? null : Math.max(0, at - now.getTime());
+}
+
 export interface RegisterOptions {
   apiUrl: string;
   platform: string;
@@ -112,7 +137,9 @@ export interface RegisterOptions {
 export async function registerAgent(opts: RegisterOptions): Promise<AgentIdentity> {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const pub = rawPublicKeyHex(publicKey);
+  const now = opts.now ?? (() => new Date());
   const chRes = await opts.fetch(`${opts.apiUrl}/identity/register-challenge`);
+  if (chRes.status === 429) throw new RateLimitedError("register-challenge", retryAfterMs(chRes, now()));
   if (!chRes.ok) throw new Error(`register-challenge answered HTTP ${chRes.status}`);
   const ch = (await chRes.json()) as { challenge: string; pow?: { seed?: string; difficulty_bits?: number } };
   const seed = ch.pow?.seed ?? ch.challenge.split(".", 1)[0]!;
@@ -133,6 +160,7 @@ export async function registerAgent(opts: RegisterOptions): Promise<AgentIdentit
     headers: { "Content-Type": "application/json", "User-Agent": `${SOURCE}` },
     body: JSON.stringify(body),
   });
+  if (res.status === 429) throw new RateLimitedError("register-pop", retryAfterMs(res, now()));
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`register-pop answered HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -144,7 +172,7 @@ export async function registerAgent(opts: RegisterOptions): Promise<AgentIdentit
     publicKeyHex: pub,
     privateKeyPkcs8: Buffer.from(privateKey.export({ format: "der", type: "pkcs8" })).toString("base64"),
     platform: opts.platform,
-    registeredAt: (opts.now ?? (() => new Date()))().toISOString(),
+    registeredAt: now().toISOString(),
   };
 }
 

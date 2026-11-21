@@ -6,6 +6,7 @@ import {
   buildMandate,
   checkSpend,
   registerAgent,
+  RateLimitedError,
   type AgentIdentity,
   type CompanyMandate,
   type FetchLike,
@@ -14,7 +15,40 @@ import { CHECK_SPEND_TOOL_DECLARATION } from "./tool.js";
 
 export const DEFAULT_ACTIONS = ["ad_spend", "purchase", "subscription", "transfer"];
 export const DEFAULT_MANDATE_DAYS = 31;
+/** First pause after a 429, doubled on each further 429 in a row, capped. */
+export const BACKOFF_BASE_MS = 60_000;
+export const BACKOFF_MAX_MS = 60 * 60_000;
+const PAGE = 500;
 const NS = "moltrust";
+
+/** Result of registering every agent of one company in one pass. */
+export interface CompanyRegistration {
+  companyId: string;
+  /** Agents seen (all statuses). */
+  agents: number;
+  /** DIDs registered in this pass. */
+  registered: number;
+  /** Agents that already had a DID. */
+  known: number;
+  /** Agents not eligible yet: terminated or pending approval. */
+  ineligible: number;
+  /** Agents left for a later pass: rate limit or a failed call. */
+  deferred: number;
+  /** True when the pass stopped early on a 429. */
+  rateLimited: boolean;
+}
+
+export interface SweepResult {
+  companies: number;
+  agents: number;
+  registered: number;
+  deferred: number;
+  rateLimited: boolean;
+}
+
+type AgentOutcome =
+  | { kind: "registered" | "known"; identity: AgentIdentity }
+  | { kind: "off" | "ineligible" | "failed" | "rate_limited" };
 
 export interface Settings {
   enabled: boolean;
@@ -56,15 +90,18 @@ interface Ledger {
 export interface Deps {
   fetch: FetchLike;
   now: () => Date;
+  /** Run one sweep over all companies when the worker starts. Default true. */
+  startupSweep?: boolean;
 }
 
 const defaultDeps: Deps = {
   fetch: (url, init) => fetch(url, init),
   now: () => new Date(),
+  startupSweep: true,
 };
 
 export function createMoltrust(ctx: PluginContext, deps: Deps = defaultDeps) {
-  const pending = new Map<string, Promise<AgentIdentity | null>>();
+  const pending = new Map<string, Promise<AgentOutcome>>();
 
   async function settings(companyId: string): Promise<Settings> {
     let raw: Record<string, unknown> = {};
@@ -81,18 +118,41 @@ export function createMoltrust(ctx: PluginContext, deps: Deps = defaultDeps) {
     return v && typeof v === "object" && typeof (v as AgentIdentity).did === "string" ? (v as AgentIdentity) : null;
   }
 
-  async function ensureAgent(companyId: string, agentId: string): Promise<AgentIdentity | null> {
+  // Rate-limit backoff, worker-wide: the MolTrust limit is per source IP, so
+  // every company on this instance draws from the same budget.
+  let blockedUntil = 0;
+  let strikes = 0;
+
+  function backoffActive(): boolean {
+    return deps.now().getTime() < blockedUntil;
+  }
+
+  function noteRateLimit(err: RateLimitedError) {
+    strikes++;
+    const exp = Math.min(BACKOFF_BASE_MS * 2 ** (strikes - 1), BACKOFF_MAX_MS);
+    const wait = Math.max(exp, Math.min(err.retryAfterMs ?? 0, BACKOFF_MAX_MS));
+    blockedUntil = deps.now().getTime() + wait;
+    ctx.logger.warn("moltrust: registration rate limited, pausing registrations", {
+      route: err.route,
+      pauseMs: wait,
+      until: new Date(blockedUntil).toISOString(),
+    });
+  }
+
+  async function registerOne(companyId: string, agentId: string): Promise<AgentOutcome> {
     const key = `${companyId}/${agentId}`;
     const running = pending.get(key);
     if (running) return running;
-    const p = (async (): Promise<AgentIdentity | null> => {
+    const p = (async (): Promise<AgentOutcome> => {
       const s = await settings(companyId);
-      if (!s.enabled) return null;
+      if (!s.enabled) return { kind: "off" };
       const known = await identityOf(agentId);
-      if (known) return known;
+      if (known) return { kind: "known", identity: known };
       const agent = await ctx.agents.get(agentId, companyId);
-      if (!agent || agent.status === "terminated" || agent.status === "pending_approval") return null;
+      if (!agent || agent.status === "terminated" || agent.status === "pending_approval") return { kind: "ineligible" };
+      if (backoffActive()) return { kind: "rate_limited" };
       const identity = await registerAgent({ apiUrl: s.apiUrl, platform: s.platform, fetch: deps.fetch, now: deps.now });
+      strikes = 0;
       await ctx.state.set({ scopeKind: "agent", scopeId: agentId, namespace: NS, stateKey: "identity" }, identity);
       await ctx.activity.log({
         companyId,
@@ -102,10 +162,14 @@ export function createMoltrust(ctx: PluginContext, deps: Deps = defaultDeps) {
         metadata: { did: identity.did, platform: identity.platform },
       });
       ctx.logger.info("moltrust: agent registered", { agentId, did: identity.did });
-      return identity;
-    })().catch((err: unknown) => {
+      return { kind: "registered", identity };
+    })().catch((err: unknown): AgentOutcome => {
+      if (err instanceof RateLimitedError) {
+        noteRateLimit(err);
+        return { kind: "rate_limited" };
+      }
       ctx.logger.warn("moltrust: registration failed, will retry on the next sweep", { agentId, error: String(err) });
-      return null;
+      return { kind: "failed" };
     });
     pending.set(key, p);
     try {
@@ -113,6 +177,64 @@ export function createMoltrust(ctx: PluginContext, deps: Deps = defaultDeps) {
     } finally {
       pending.delete(key);
     }
+  }
+
+  async function ensureAgent(companyId: string, agentId: string): Promise<AgentIdentity | null> {
+    const r = await registerOne(companyId, agentId);
+    return r.kind === "registered" || r.kind === "known" ? r.identity : null;
+  }
+
+  async function listAll<T>(page: (offset: number) => Promise<T[]>): Promise<T[]> {
+    const out: T[] = [];
+    for (let offset = 0; ; offset += PAGE) {
+      const batch = await page(offset);
+      out.push(...batch);
+      if (batch.length < PAGE) return out;
+    }
+  }
+
+  /**
+   * Register every agent of one company in one pass: all agents without a DID,
+   * one after the other, idempotent (agents with a stored DID cost no call).
+   * Stops at the first 429 and leaves the rest to a later pass; while the
+   * backoff runs, no registration call is made at all.
+   */
+  async function registerCompany(companyId: string): Promise<CompanyRegistration> {
+    const r: CompanyRegistration = { companyId, agents: 0, registered: 0, known: 0, ineligible: 0, deferred: 0, rateLimited: false };
+    const s = await settings(companyId);
+    if (!s.enabled) return r;
+    await ensureMandate(companyId);
+    const agents = await listAll((offset) => ctx.agents.list({ companyId, limit: PAGE, offset }));
+    r.agents = agents.length;
+    for (const a of agents) {
+      if (r.rateLimited) {
+        // Agents with a DID still count as known; the rest wait for the next pass.
+        if (await identityOf(a.id)) r.known++;
+        else if (a.status === "terminated" || a.status === "pending_approval") r.ineligible++;
+        else r.deferred++;
+        continue;
+      }
+      const o = await registerOne(companyId, a.id);
+      if (o.kind === "registered") r.registered++;
+      else if (o.kind === "known") r.known++;
+      else if (o.kind === "ineligible" || o.kind === "off") r.ineligible++;
+      else if (o.kind === "rate_limited") {
+        r.deferred++;
+        r.rateLimited = true;
+      } else r.deferred++;
+    }
+    if (r.registered > 0 || r.deferred > 0) {
+      await ctx.activity.log({
+        companyId,
+        entityType: "company",
+        entityId: companyId,
+        message:
+          `MolTrust: ${r.registered} agent(s) registered in one pass, ${r.known} already had a DID` +
+          (r.deferred ? `, ${r.deferred} left for the reconcile job${r.rateLimited ? " (MolTrust rate limit)" : ""}` : ""),
+        metadata: { ...r },
+      });
+    }
+    return r;
   }
 
   async function ensureMandate(companyId: string, force = false): Promise<StoredMandate | null> {
@@ -229,22 +351,30 @@ export function createMoltrust(ctx: PluginContext, deps: Deps = defaultDeps) {
     return { error: `${verdict.verdict}: do not execute ${action} of ${amount} cents. ${verdict.reason}`, data };
   }
 
-  async function sweep(): Promise<{ companies: number; agents: number }> {
-    let agents = 0;
-    const companies = await ctx.companies.list({ limit: 500 });
-    for (const c of companies) {
-      const s = await settings(c.id);
-      if (!s.enabled) continue;
-      await ensureMandate(c.id);
-      const list = await ctx.agents.list({ companyId: c.id, limit: 500 });
-      for (const a of list) {
-        if (await ensureAgent(c.id, a.id)) agents++;
+  let sweeping: Promise<SweepResult> | null = null;
+
+  /** registerCompany for every company on the instance; one sweep at a time. */
+  function sweep(): Promise<SweepResult> {
+    if (sweeping) return sweeping;
+    sweeping = (async (): Promise<SweepResult> => {
+      const out: SweepResult = { companies: 0, agents: 0, registered: 0, deferred: 0, rateLimited: false };
+      const companies = await listAll((offset) => ctx.companies.list({ limit: PAGE, offset }));
+      out.companies = companies.length;
+      for (const c of companies) {
+        const r = await registerCompany(c.id);
+        out.agents += r.registered + r.known;
+        out.registered += r.registered;
+        out.deferred += r.deferred;
+        out.rateLimited ||= r.rateLimited;
       }
-    }
-    return { companies: companies.length, agents };
+      return out;
+    })().finally(() => {
+      sweeping = null;
+    });
+    return sweeping;
   }
 
-  return { ensureAgent, ensureMandate, checkSpendTool, sweep, identityOf, settings };
+  return { ensureAgent, ensureMandate, registerCompany, checkSpendTool, sweep, identityOf, settings, backoffActive };
 }
 
 export function makePlugin(deps: Deps = defaultDeps) {
@@ -267,10 +397,18 @@ export function makePlugin(deps: Deps = defaultDeps) {
       });
       ctx.jobs.register("reconcile", async () => {
         const r = await mt.sweep();
-        ctx.logger.info("moltrust: reconcile sweep", r);
+        ctx.logger.info("moltrust: reconcile sweep", { ...r });
       });
       ctx.tools.register(CHECK_SPEND_TOOL_DECLARATION.name, CHECK_SPEND_TOOL_DECLARATION, (params, run) => mt.checkSpendTool(params, run));
       ctx.logger.info("moltrust plugin ready");
+      // One pass over every company right away, so agents that existed before
+      // the install are registered in one step instead of waiting for the
+      // first reconcile tick. The host restarts the worker on a config change
+      // (no onConfigChanged here), so switching a company on runs this too.
+      if (deps.startupSweep !== false) void mt.sweep().then(
+        (r) => ctx.logger.info("moltrust: startup sweep", { ...r }),
+        (err: unknown) => ctx.logger.warn("moltrust: startup sweep failed, the reconcile job retries", { error: String(err) }),
+      );
     },
     async onHealth() {
       return { status: "ok", message: "MolTrust plugin ready" };
